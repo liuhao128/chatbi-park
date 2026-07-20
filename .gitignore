@@ -1,0 +1,12 @@
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Local environment and IDE settings
+.env
+.idea/
+
+# Local vector indexes
+chroma_db/
