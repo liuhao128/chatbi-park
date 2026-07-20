@@ -22,7 +22,7 @@ def _build_default_db_source() -> dict[str, object]:
         "port": int(os.getenv("DB_PORT", 3306)),
         "user": os.getenv("DB_USER", "root"),
         "password": os.getenv("DB_PASSWORD", "root"),
-        "database": os.getenv("DB_NAME", "chatbi_mvp"),
+        "database": os.getenv("DB_NAME", "chatbi_park"),
         "charset": "utf8mb4",
         "autocommit": True,
         "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 5)),

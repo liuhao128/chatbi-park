@@ -3,6 +3,7 @@
 -- 说明：本脚本不创建任何外键约束，表间关系由应用层和数据治理规则维护。
 
 SET NAMES utf8mb4;
+USE chatbi_park;
 
 DROP TABLE IF EXISTS agg_parking_hourly;
 DROP TABLE IF EXISTS agg_parking_daily;
@@ -106,4 +107,3 @@ CREATE TABLE agg_parking_hourly (
     PRIMARY KEY (stat_date, stat_hour, parking_lot_id),
     KEY idx_hourly_lot_date (parking_lot_id, stat_date, stat_hour)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='停车场小时经营汇总表';
-
