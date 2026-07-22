@@ -790,8 +790,8 @@ def retrieve_schema(
     query: str,
     table_top_k: int = 3,
     field_top_k: int = 10,
-    table_threshold: float = 0.2,
-    field_threshold: float = 0.15,
+    table_threshold: float = 0.3,
+    field_threshold: float = 0.25,
 ) -> dict:
     """先召回停车表，再在候选表范围内匹配字段。"""
     tables = retrieve_tables(query, top_k=table_top_k, score_threshold=table_threshold)
