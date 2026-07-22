@@ -16,91 +16,64 @@ from tools.config import LLM_CONFIG
 
 
 # ==================== 表描述数据 ====================
-# 每张表构建一段结构化的"自然语言描述"用于向量化检索
-# 包含 5 张业务相关表 + 4 张不相关表，验证检索的区分能力
+# 每张表构建一段结构化的自然语言描述用于向量化检索。
+# 表集合与 database/01_schema.sql 的智慧停车 MVP 六表保持一致。
 TABLE_METADATA = {
-    # ---- 业务相关表 ----
-    "dim_customers": {
+    "dim_parking_lot": {
         "description": (
-            "客户维度表：存储客户基本信息，包括客户名称、客户类型"
-            "（OEM整车厂、储能集成商、电网集团等）、所属行业（交通、能源、工业）、"
-            "所在国家和销售大区（欧洲、北美、亚太等）。"
-            "用于按客户维度分析收入、利润和订单分布。"
+            "停车场维度表：一行代表一个停车场，保存停车场名称、运营商、城市、"
+            "停车场类型、总车位数和运营状态。用于按停车场、城市或停车场类型"
+            "分析停车收入、订单量、车位利用率、停车时长和异常情况，也用于停车场排行。"
         ),
         "domain": "维度表",
-        "key_fields": "customer_id, customer_name, customer_type, industry, country, region",
+        "key_fields": "parking_lot_id, parking_lot_name, operator_id, city_name, parking_lot_type, total_spaces, operation_status, updated_at",
     },
-    "dim_products": {
+    "fact_parking_order": {
         "description": (
-            "产品维度表：存储产品主数据，包括产品名称、产品线"
-            "（动力电池-乘用车、储能系统-电网级等）、技术路线（三元锂、磷酸铁锂等）、"
-            "以及产品成本信息（标准成本、材料成本、人工成本）。"
-            "用于按产品维度分析收入、毛利、成本结构。"
+            "停车订单事实表：一行代表一笔停车订单，记录停车场、订单类型、入场时间、"
+            "出场时间、停车时长、订单状态、应收金额、优惠金额、实收金额、退款金额、"
+            "支付状态、支付方式、人工抬杆和免费放行。用于订单明细、停车净收入、"
+            "车流量、平均停车时长、支付成功率、退款和优惠分析。"
         ),
-        "domain": "维度表",
-        "key_fields": "product_id, product_name, product_line, category, tech_route, standard_cost, material_cost, labor_cost",
+        "domain": "明细事实表",
+        "key_fields": "order_id, parking_lot_id, order_type, entry_time, exit_time, parking_minutes, order_status, receivable_amount, discount_amount, paid_amount, refund_amount, payment_status, payment_method, manual_open_flag, free_release_flag, updated_at",
     },
-    "sales_orders": {
+    "fact_space_snapshot": {
         "description": (
-            "销售订单表：记录每笔销售订单的详细信息，包括订单日期、订单状态、"
-            "数量、单价、折扣、含税总额（gross_amount）、不含税收入（net_amount）、币种。"
-            "通过 customer_id 和 product_id 关联客户表和产品表。"
-            "是收入分析、订单统计的核心事实表。"
+            "车位状态快照事实表：一行代表某停车场某个时刻的车位状态，记录快照时间、"
+            "可运营总车位数、已占用车位数和空闲车位数。用于当前空闲车位、历史占用、"
+            "车位利用率、空闲率和停车高峰分析。利用率由 occupied_spaces 除以 total_spaces。"
         ),
-        "domain": "事实表",
-        "key_fields": "order_id, order_no, customer_id, product_id, region, order_date, order_status, quantity, unit_price, discount_amount, gross_amount, net_amount, currency",
+        "domain": "明细事实表",
+        "key_fields": "snapshot_id, parking_lot_id, snapshot_time, total_spaces, occupied_spaces, free_spaces",
     },
-    "exchange_rates": {
+    "fact_operation_event": {
         "description": (
-            "汇率表：按日期和币种记录兑人民币汇率（rate_to_cny）。"
-            "当订单涉及多币种时，需关联此表将金额统一折算为人民币。"
-            "用于多币种收入汇总和跨区域财务对比。"
+            "运营异常事件事实表：一行代表一次停车运营异常或人工操作事件，记录停车场、"
+            "可选关联订单、事件时间、事件类型、严重程度、处理状态和预估收入损失。"
+            "用于分析支付失败、设备离线、车牌识别失败、人工抬杆、异常数量和收入下降原因。"
         ),
-        "domain": "参考表",
-        "key_fields": "rate_date, currency, rate_to_cny",
+        "domain": "明细事实表",
+        "key_fields": "event_id, parking_lot_id, order_id, event_time, event_type, severity, event_status, estimated_loss, description",
     },
-    "finance_expenses": {
+    "agg_parking_daily": {
         "description": (
-            "费用表：记录企业各部门的期间费用明细，包括研发费用、销售费用、"
-            "管理费用、财务费用，以及销售费用的子项（市场费用、物流费用、质保费用）。"
-            "用于费用分析、利润计算（利润 = 毛利 - 期间费用）。"
+            "停车场日经营汇总事实表：一行代表一个停车场一个自然日，包含完成订单量、"
+            "停车净收入、平均停车时长、平均占用车位数、车位利用率、人工抬杆次数、"
+            "免费放行次数和异常数量。优先用于今天、最近七天、最近三个月、月度趋势、"
+            "停车场排名、收入下降和利用率变化等经营分析。"
         ),
-        "domain": "事实表",
-        "key_fields": "expense_id, expense_date, department, rd_expense, selling_expense, admin_expense, finance_expense, marketing_expense, logistics_expense, warranty_expense",
+        "domain": "日聚合事实表",
+        "key_fields": "stat_date, parking_lot_id, order_count, net_revenue, average_parking_minutes, average_occupied_spaces, utilization_rate, manual_open_count, free_release_count, exception_count, updated_at",
     },
-    # ---- 不相关表（用于验证检索区分能力）----
-    "hr_attendance_records": {
+    "agg_parking_hourly": {
         "description": (
-            "人力考勤表：记录员工每日上下班打卡、请假、加班、排班班次和异常考勤。"
-            "用于 HR 出勤统计、缺勤分析和薪资核算，不参与销售收入或产品利润分析。"
+            "停车场小时经营汇总事实表：一行代表一个停车场某天某个小时，包含小时完成订单量、"
+            "停车净收入、平均占用车位数、车位利用率和异常数量。优先用于几点最忙、"
+            "高峰时段、小时收入、小时车流和小时利用率分析。"
         ),
-        "domain": "HR系统",
-        "key_fields": "record_id, employee_id, check_in_time, check_out_time, attendance_status, shift_type",
-    },
-    "iot_device_alerts": {
-        "description": (
-            "IoT 设备告警表：记录工厂设备、传感器、产线控制器上报的温度异常、"
-            "震动异常、离线告警和维护工单。用于设备运维监控与预测性维护，"
-            "不用于客户、订单、费用或汇率分析。"
-        ),
-        "domain": "设备运维",
-        "key_fields": "alert_id, device_id, alert_type, severity, alert_time, resolution_status",
-    },
-    "legal_contract_archive": {
-        "description": (
-            "法务合同档案表：存储合同编号、签署主体、法务审核意见、诉讼状态、"
-            "保密条款和履约风险评级。用于合同管理与法务合规，不用于销售分析。"
-        ),
-        "domain": "法务系统",
-        "key_fields": "contract_id, contract_no, party_name, legal_opinion, litigation_status, risk_rating",
-    },
-    "warehouse_temperature_logs": {
-        "description": (
-            "仓储温湿度日志表：记录仓库各货位每小时温度、湿度、冷链设备状态和巡检结果。"
-            "用于仓储环境监控和质量追溯，不用于收入、毛利、客户或费用统计。"
-        ),
-        "domain": "仓储管理",
-        "key_fields": "log_id, warehouse_id, location_code, temperature, humidity, equipment_status",
+        "domain": "小时聚合事实表",
+        "key_fields": "stat_date, stat_hour, parking_lot_id, order_count, net_revenue, occupied_spaces, utilization_rate, exception_count, updated_at",
     },
 }
 
@@ -166,19 +139,21 @@ def build_index(force_rebuild: bool = False) -> Chroma:
     """
     vectorstore = get_vectorstore()
 
-    # 检查是否已有数据
+    # 检查是否已有数据；业务迁移后即使 collection 非空，也不能继续复用旧表 ID。
     existing = vectorstore._collection.count()
-    if existing > 0 and not force_rebuild:
+    existing_ids = set(vectorstore._collection.get()["ids"]) if existing > 0 else set()
+    expected_ids = set(TABLE_METADATA)
+    index_matches_metadata = existing_ids == expected_ids
+    if existing > 0 and not force_rebuild and index_matches_metadata:
         print(f"已有索引数据（{existing} 条），跳过重建。如需重建请传入 force_rebuild=True")
         return vectorstore
 
-    # 清空旧数据（如果 force_rebuild）
-    if force_rebuild and existing > 0:
+    # 强制重建或索引 ID 与当前停车元数据不一致时清空旧数据。
+    if existing > 0 and (force_rebuild or not index_matches_metadata):
         # ChromaDB 较新版本不支持空 where 过滤，用 delete 逐个删除
-        existing_ids = vectorstore._collection.get()["ids"]
         if existing_ids:
-            vectorstore._collection.delete(ids=existing_ids)
-        print("已清空旧索引数据")
+            vectorstore._collection.delete(ids=list(existing_ids))
+        print("已清空与当前停车表元数据不一致的旧索引数据")
 
     # 构建 Document 列表
     documents = []
@@ -259,11 +234,11 @@ if __name__ == "__main__":
 
     # 第二步：测试检索
     test_questions = [
-        "欧洲市场最近三个月的销售额是多少？",
-        "各产品线的毛利率",
-        "上个月的研发费用和销售费用对比",
-        "查询已完成订单的总数量",
-        "按客户类型统计收入，需要换算成人民币",
+        "今天停车收入是多少？",
+        "最近三个月收入趋势？",
+        "哪个停车场收入最高？",
+        "哪个停车场利用率最低？",
+        "平均停车时长是多少？",
     ]
 
     print()
@@ -279,8 +254,8 @@ if __name__ == "__main__":
             print("  （无满足阈值的结果）")
 
     # 第三步：演示元数据过滤
-    print("\n\n--- 元数据过滤演示：仅检索事实表 ---")
-    results = retrieve_tables("上个月的收入和利润", top_k=3, domain_filter="事实表")
-    print("问题：上个月的收入和利润（仅事实表）")
+    print("\n\n--- 元数据过滤演示：仅检索日聚合事实表 ---")
+    results = retrieve_tables("最近三个月停车收入趋势", top_k=3, domain_filter="日聚合事实表")
+    print("问题：最近三个月停车收入趋势（仅日聚合事实表）")
     for r in results:
         print(f"  ✓ {r['table_name']:30s} 相似度: {r['score']:.4f}  [{r['domain']}]")

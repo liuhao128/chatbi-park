@@ -32,9 +32,9 @@ def _ensure_fact_table_for_metric(query: str, tables: list[dict]) -> list[dict]:
     """
     兜底策略：对于指标型问题，确保召回结果中包含语义最相关的事实表。
 
-    背景：table_retriever 基于 Embedding 相似度召回，可能把"毛利率"这种问题
-    错误地关联到 finance_expenses（费用表），而 sales_orders（订单事实表）
-    才是计算毛利的正确来源。因此需要结合17课的关键词规则做二次校验。
+    背景：table_retriever 基于 Embedding 相似度召回，可能把停车收入趋势同时
+    关联到订单明细、日汇总和小时汇总。只有符合问题粒度的事实表才适合作为
+    SQL 锚表，因此需要结合停车业务关键词做二次校验。
 
     逻辑：
     1. 无强指标词时跳过；
@@ -81,6 +81,102 @@ def _ensure_fact_table_for_metric(query: str, tables: list[dict]) -> list[dict]:
     return tables
 
 
+def _ensure_parking_lot_dimension(query: str, tables: list[dict]) -> list[dict]:
+    """停车场比较、排名和点名查询必须包含停车场维度表。"""
+    dimension_signals = ("停车场", "车场", "场库", "城市", "停车场类型")
+    if not any(signal in query for signal in dimension_signals):
+        return tables
+
+    existing_names = {table["table_name"] for table in tables}
+    if "dim_parking_lot" in existing_names:
+        return tables
+
+    broad_candidates = retrieve_tables(query, top_k=10, score_threshold=0.0)
+    parking_lot_dimension = next(
+        (
+            table for table in broad_candidates
+            if table["table_name"] == "dim_parking_lot"
+        ),
+        None,
+    )
+    if parking_lot_dimension is not None:
+        return tables + [parking_lot_dimension]
+    return tables
+
+
+def _route_parking_fact_tables(query: str, tables: list[dict]) -> list[dict]:
+    """
+    用停车业务粒度规则收敛向量召回，避免多张事实表在明细层直接 Join。
+
+    Embedding 负责高召回，路由规则负责为一个简单分析问题保留最合适的事实粒度。
+    原因诊断类问题允许保留日汇总与异常事件，供 Agent 后续拆成独立任务；
+    Schema Context 只提供逻辑连接，不表示应做明细级多对多聚合。
+    """
+    preferred_tables: list[str] = []
+    is_cause_analysis = any(word in query for word in ("为什么", "原因", "归因"))
+    is_hourly = any(word in query for word in ("高峰", "几点", "小时", "时段", "几点最忙"))
+    is_realtime_space = any(
+        word in query
+        for word in ("当前", "实时", "空闲车位", "剩余车位", "还有多少车位", "快照")
+    )
+    is_utilization = any(word in query for word in ("利用率", "占用率", "空闲率"))
+    is_duration = any(word in query for word in ("停车时长", "停留时长", "平均时长", "停了多久"))
+    is_order_detail = any(
+        word in query
+        for word in (
+            "支付", "退款", "退费", "优惠", "应收", "实收", "订单明细",
+            "订单类型", "入场", "出场", "进场", "离场", "车流量",
+            "人工抬杆", "免费放行",
+        )
+    )
+    is_exception = any(
+        word in query
+        for word in ("异常", "设备离线", "支付失败", "车牌识别", "预估损失", "未解决")
+    )
+    is_revenue = any(word in query for word in ("收入", "营收", "停车费", "净收入"))
+    is_daily_analysis = any(
+        word in query
+        for word in ("今天", "昨日", "昨天", "最近", "趋势", "同比", "环比", "本月", "上月", "最高", "最低", "排名", "下降")
+    )
+
+    if is_hourly:
+        preferred_tables.append("agg_parking_hourly")
+    elif is_realtime_space:
+        preferred_tables.append("fact_space_snapshot")
+    elif is_utilization:
+        preferred_tables.append("agg_parking_daily")
+    elif is_duration and not is_daily_analysis:
+        preferred_tables.append("fact_parking_order")
+    elif is_order_detail:
+        preferred_tables.append("fact_parking_order")
+    elif is_exception and not is_revenue:
+        preferred_tables.append("fact_operation_event")
+    elif is_revenue or is_daily_analysis:
+        preferred_tables.append("agg_parking_daily")
+
+    if is_cause_analysis or (is_exception and is_revenue):
+        if "agg_parking_daily" not in preferred_tables:
+            preferred_tables.append("agg_parking_daily")
+        if "fact_operation_event" not in preferred_tables:
+            preferred_tables.append("fact_operation_event")
+
+    if not preferred_tables:
+        return tables
+
+    candidate_by_name = {table["table_name"]: table for table in tables}
+    missing_names = [name for name in preferred_tables if name not in candidate_by_name]
+    if missing_names:
+        broad_candidates = retrieve_tables(query, top_k=10, score_threshold=0.0)
+        candidate_by_name.update({table["table_name"]: table for table in broad_candidates})
+
+    routed = [
+        candidate_by_name[table_name]
+        for table_name in preferred_tables
+        if table_name in candidate_by_name
+    ]
+    return routed or tables
+
+
 def schema_link(
     query: str,
     table_top_k: int = 3,
@@ -121,6 +217,12 @@ def schema_link(
 
     # 兜底：指标型问题必须召回事实表，否则 SQL 无法生成
     tables = _ensure_fact_table_for_metric(query, tables)
+
+    # 用业务粒度收敛事实表，避免将日、小时和明细事实同时注入简单查询。
+    tables = _route_parking_fact_tables(query, tables)
+
+    # 停车场排名或指定停车场查询需要名称维度，避免只返回 parking_lot_id。
+    tables = _ensure_parking_lot_dimension(query, tables)
 
     candidate_table_names = [t["table_name"] for t in tables]
 
@@ -275,11 +377,11 @@ if __name__ == "__main__":
 
     # 测试问题集
     test_questions = [
-        "按客户类型统计各产品线的收入，需要换算成人民币",
-        "各产品线的毛利率",
-        "上个月的研发费用和销售费用对比",
-        "查询德国客户的订单总额",
-        "哪些客户没有下过订单",
+        "今天停车收入是多少？",
+        "最近三个月收入趋势？",
+        "哪个停车场收入最高？",
+        "哪个停车场利用率最低？",
+        "平均停车时长是多少？",
     ]
 
     for question in test_questions:
@@ -311,7 +413,7 @@ if __name__ == "__main__":
     print(f"\n\n{'='*60}")
     print("Token 消耗对比（粗略估算）")
     print("=" * 60)
-    full_schema_tokens = 1500  # 全量 Schema 约 1500 tokens
+    full_schema_tokens = 1800  # 停车六表全量 Schema 的粗略估算
     for question in test_questions[:3]:
         result = schema_link(question)
         dynamic_tokens = len(result["dynamic_schema"]) // 2  # 粗略估算：2字符≈1token

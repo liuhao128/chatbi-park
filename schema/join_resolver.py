@@ -19,78 +19,122 @@ from collections import deque
 # 2. 需要区分 JOIN / LEFT JOIN
 # 3. 支持复合键
 TABLE_RELATIONSHIPS = {
-    "sales_orders": [
+    "dim_parking_lot": [
         {
-            "target": "dim_customers",
-            "fk_col": "customer_id",
-            "pk_col": "customer_id",
+            "target": "fact_parking_order",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "LEFT JOIN",
+        },
+        {
+            "target": "fact_space_snapshot",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "LEFT JOIN",
+        },
+        {
+            "target": "fact_operation_event",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "LEFT JOIN",
+        },
+        {
+            "target": "agg_parking_daily",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "LEFT JOIN",
+        },
+        {
+            "target": "agg_parking_hourly",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "LEFT JOIN",
+        },
+    ],
+    "fact_parking_order": [
+        {
+            "target": "dim_parking_lot",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
             "join_type": "JOIN",
         },
         {
-            "target": "dim_products",
-            "fk_col": "product_id",
-            "pk_col": "product_id",
+            "target": "fact_operation_event",
+            "fk_col": "order_id",
+            "pk_col": "order_id",
+            "join_type": "LEFT JOIN",
+        },
+    ],
+    "fact_space_snapshot": [
+        {
+            "target": "dim_parking_lot",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "JOIN",
+        },
+    ],
+    "fact_operation_event": [
+        {
+            "target": "dim_parking_lot",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
             "join_type": "JOIN",
         },
         {
-            "target": "exchange_rates",
-            "fk_col": "order_date, currency",
-            "pk_col": "rate_date, currency",
+            "target": "fact_parking_order",
+            "fk_col": "order_id",
+            "pk_col": "order_id",
             "join_type": "LEFT JOIN",
         },
     ],
-    # 从维度表出发找事实表时，应使用 LEFT JOIN：不是所有维度值都有对应的事实记录
-    "dim_customers": [
+    "agg_parking_daily": [
         {
-            "target": "sales_orders",
-            "fk_col": "customer_id",
-            "pk_col": "customer_id",
-            "join_type": "LEFT JOIN",
+            "target": "dim_parking_lot",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "JOIN",
         },
     ],
-    "dim_products": [
+    "agg_parking_hourly": [
         {
-            "target": "sales_orders",
-            "fk_col": "product_id",
-            "pk_col": "product_id",
-            "join_type": "LEFT JOIN",
+            "target": "dim_parking_lot",
+            "fk_col": "parking_lot_id",
+            "pk_col": "parking_lot_id",
+            "join_type": "JOIN",
         },
     ],
-    "exchange_rates": [
-        {
-            "target": "sales_orders",
-            "fk_col": "rate_date, currency",
-            "pk_col": "order_date, currency",
-            "join_type": "LEFT JOIN",
-        },
-    ],
-    # 费用表与订单表在业务上独立，不建立直接关联
-    "finance_expenses": [],
 }
 
 
 # ==================== 表类型与业务关键词 ====================
 TABLE_TYPES = {
-    "sales_orders": "fact",
-    "finance_expenses": "fact",
-    "dim_customers": "dimension",
-    "dim_products": "dimension",
-    "exchange_rates": "reference",
+    "dim_parking_lot": "dimension",
+    "fact_parking_order": "fact",
+    "fact_space_snapshot": "fact",
+    "fact_operation_event": "fact",
+    # Schema Linker 的指标事实表兜底只识别 fact，因此聚合事实也标为 fact。
+    "agg_parking_daily": "fact",
+    "agg_parking_hourly": "fact",
 }
 
 # 用于锚表选择的关键词匹配
 TABLE_KEYWORDS = {
-    "sales_orders": ["收入", "销售额", "订单", "销售", "数量", "金额", "毛利", "利润", "net_amount", "gross_amount"],
-    "finance_expenses": ["费用", "研发", "销售费用", "管理费用", "财务费用", "期间费用", "expense"],
-    "dim_customers": ["客户", "客户类型", "OEM", "储能集成商", "电网集团", "customer"],
-    "dim_products": ["产品", "产品线", "型号", "SKU", "product"],
-    "exchange_rates": ["汇率", "币种", "人民币", "美元", "欧元", "rate"],
+    "dim_parking_lot": ["停车场", "车场", "场库", "停车场名称", "城市", "停车场类型", "运营状态", "哪个停车场", "各停车场"],
+    "fact_parking_order": ["停车订单", "订单明细", "支付", "退款", "优惠", "实收", "应收", "平均", "平均停车时长", "平均时长", "停了多久", "停车时长", "入场", "出场", "车流量", "人工抬杆", "免费放行"],
+    "fact_space_snapshot": ["车位", "泊位", "空闲车位", "剩余车位", "已占用", "占用车位", "当前利用率", "实时利用率", "快照"],
+    "fact_operation_event": ["异常", "原因", "设备离线", "支付失败", "车牌识别", "预估损失", "事件", "未解决"],
+    "agg_parking_daily": ["今天", "昨日", "最近", "近三个月", "趋势", "月度", "同比", "环比", "排名", "收入", "净收入", "订单量", "平均停车时长", "利用率", "下降"],
+    "agg_parking_hourly": ["小时", "几点", "高峰", "时段", "几点最忙", "小时收入", "小时订单", "小时利用率"],
 }
 
 # 查询意图信号词
-METRIC_SIGNALS = ["统计", "多少", "总计", "平均", "占比", "总和", "额", "量"]
-ENTITY_SIGNALS = ["列出", "哪些", "所有", "没有", "明细", "每个"]
-STRONG_METRIC_WORDS = ["收入", "销售额", "费用", "毛利", "利润", "金额", "数量"]
+METRIC_SIGNALS = ["统计", "多少", "总计", "平均", "占比", "总和", "率", "额", "量", "趋势", "最高", "最低"]
+ENTITY_SIGNALS = ["列出", "哪些", "所有", "没有", "明细", "每个", "停车场"]
+STRONG_METRIC_WORDS = [
+    "收入", "停车费", "订单量", "订单数", "停车次数", "车流量",
+    "利用率", "空闲率", "停车时长", "支付成功率", "退款金额",
+    "异常数量", "预估损失",
+]
 
 
 # ==================== 锚表选择 ====================
@@ -168,8 +212,8 @@ def select_anchor(query: str, candidate_tables: list[str], relationships: dict =
     根据用户问题选择锚表。
 
     锚表 = SQL 中 FROM 子句的第一张表。它应该对应用户问题的语义主体：
-    - 指标型问题（问收入、费用、毛利等）→ 锚表是承载该指标的事实表
-    - 实体型问题（问客户、产品、汇率等）→ 锚表是承载该实体的维度/参考表
+    - 指标型问题（问收入、利用率、订单量等）→ 锚表是承载该指标的事实表
+    - 实体型问题（问停车场、城市、停车场类型等）→ 锚表是承载该实体的维度表
 
     Args:
         query: 用户自然语言问题
@@ -310,34 +354,12 @@ def _build_sql_fragment(anchor_table: str, joins: list[dict]) -> str:
 # ==================== 演示 ====================
 if __name__ == "__main__":
     test_cases = [
-        {
-            "query": "按客户类型统计收入",
-            "tables": ["sales_orders", "dim_customers"],
-        },
-        {
-            "query": "列出所有客户",
-            "tables": ["dim_customers"],
-        },
-        {
-            "query": "哪些客户没有下过订单",
-            "tables": ["dim_customers", "sales_orders"],
-        },
-        {
-            "query": "各产品线的毛利率",
-            "tables": ["sales_orders", "dim_products"],
-        },
-        {
-            "query": "上个月的研发费用",
-            "tables": ["finance_expenses"],
-        },
-        {
-            "query": "按客户类型统计各产品线的收入，需要换算成人民币",
-            "tables": ["sales_orders", "dim_customers", "dim_products", "exchange_rates"],
-        },
-        {
-            "query": "销售收入和期间费用对比",
-            "tables": ["sales_orders", "finance_expenses"],
-        },
+        {"query": "最近三个月停车收入趋势", "tables": ["agg_parking_daily"]},
+        {"query": "哪个停车场收入最高", "tables": ["agg_parking_daily", "dim_parking_lot"]},
+        {"query": "哪个停车场利用率最低", "tables": ["agg_parking_daily", "dim_parking_lot"]},
+        {"query": "当前各停车场还有多少空闲车位", "tables": ["fact_space_snapshot", "dim_parking_lot"]},
+        {"query": "今天几点停车最繁忙", "tables": ["agg_parking_hourly"]},
+        {"query": "收入下降是否与异常增加有关", "tables": ["agg_parking_daily", "fact_operation_event"]},
     ]
 
     print("=" * 70)
