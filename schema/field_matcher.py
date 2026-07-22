@@ -727,17 +727,21 @@ def match_fields(
         if candidate_tables and doc.metadata["table_name"] not in candidate_tables:
             continue
 
-        # evaluate_rules 已执行 force_exclude -= force_include，因此这里硬排除时
-        # 仍然保持“更具体白名单优先”的覆盖语义。
-        if field_key in force_exclude:
-            continue
-
+        # 业务规则分参与混合评分：
+        # 白名单字段加分，黑名单字段减分，未命中规则的字段保持 0 分。
+        # 注意：黑名单字段不能只依赖减分，因为它的 Embedding 分数较高时，
+        # 混合后的最终分数仍可能超过阈值，所以排序后还要执行一次强制移除。
         rule_score = 0.0
         rule_applied = None
         if field_key in force_include:
             rule_score = 1.0
             rule_applied = "强制包含"
+        elif field_key in force_exclude:
+            rule_score = -1.0
+            rule_applied = "强制移除"
 
+        # 混合分数 = 向量语义相似度 + 业务规则分。
+        # 默认 rule_weight=0.3，即向量分占 70%，业务规则分占 30%。
         final_score = (1 - rule_weight) * embedding_score + rule_weight * rule_score
         scored_fields.append({
             "field_key": field_key,
@@ -764,10 +768,20 @@ def match_fields(
                 "description": meta["description"],
             })
 
+    # 先按混合分数从高到低排序，保证正常字段和白名单字段按统一标准竞争 Top-K。
     scored_fields.sort(key=lambda item: item["score"], reverse=True)
+
+    # 最终过滤同时执行两条规则：
+    # 1. 移除低于最低分数阈值的字段；
+    # 2. 强制移除黑名单字段，即使其 Embedding 分数很高、混合分数超过阈值也不返回。
+    # evaluate_rules() 已执行 force_exclude -= force_include，因此同一字段同时命中
+    # 白名单和黑名单时仍然是白名单优先，不会在这里被错误移除。
     scored_fields = [
         field for field in scored_fields
-        if field["score"] >= score_threshold
+        if (
+            field["score"] >= score_threshold
+            and field["field_key"] not in force_exclude
+        )
     ]
     return scored_fields[:top_k]
 
