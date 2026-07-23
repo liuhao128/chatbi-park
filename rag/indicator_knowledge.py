@@ -1,26 +1,34 @@
-"""
-指标知识模块
+"""智慧停车指标知识关键词兜底模块。
 
-负责加载指标定义、识别用户问题中的指标关键词、
-生成指标知识文本并注入 Prompt。
-
-第9课实战：最简指标知识注入，为第18-19课完整知识库做铺垫。
+向量 RAG 不可用或未命中时，通过指标名称和别名完成确定性识别，
+并从同一份停车指标知识源生成可注入 Text2SQL 的业务上下文。
 """
 
 import json
 from pathlib import Path
-from typing import Optional
+
+
+def _load_knowledge_file(config_path: Path) -> dict:
+    """加载指标 JSON，并解析轻量 source 引用，避免维护两份指标口径。"""
+    with config_path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    source = data.get("source")
+    if source:
+        source_path = config_path.parent / source
+        with source_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    return data
 
 
 class IndicatorKnowledge:
-    """指标知识模块：加载指标定义、识别问题中的指标、生成指标知识文本"""
+    """加载停车指标、识别名称/别名并生成知识块。"""
 
     def __init__(self, config_path: str | Path | None = None):
         resolved_path = Path(config_path) if config_path else Path(__file__).with_name("indicators.json")
-        with resolved_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _load_knowledge_file(resolved_path)
+        self.knowledge_version = data.get("knowledge_version", "")
         self.indicators = {ind["name"]: ind for ind in data["indicators"]}
-        # 构建别名到标准名称的映射
         self.alias_map = {}
         for ind in data["indicators"]:
             self.alias_map[ind["name"].lower()] = ind["name"]
@@ -42,16 +50,26 @@ class IndicatorKnowledge:
         if not ind:
             return ""
 
-        lines = [
+        lines: list[str] = [
             f"指标：{ind['name']}",
             f"  定义：{ind['definition']}",
             f"  计算公式：{ind['formula']}",
             f"  数据来源：{ind['data_source']}",
         ]
+        if ind.get("tables"):
+            lines.append(f"  关联表：{', '.join(ind['tables'])}")
+        if ind.get("fields"):
+            lines.append(f"  关联字段：{', '.join(ind['fields'])}")
+        if ind.get("time_field"):
+            lines.append(f"  时间口径：{ind['time_field']}")
+        if ind.get("dimensions"):
+            lines.append(f"  支持维度：{', '.join(ind['dimensions'])}")
         if ind.get("depends_on"):
             lines.append(f"  依赖指标：{', '.join(ind['depends_on'])}")
         if ind.get("filters"):
             lines.append(f"  强制过滤：{' AND '.join(ind['filters'])}")
+        if ind.get("business_rules"):
+            lines.append(f"  业务规则：{'；'.join(ind['business_rules'])}")
         return "\n".join(lines)
 
     def build_knowledge_block(self, question: str) -> str:
@@ -89,13 +107,13 @@ class IndicatorKnowledge:
 
 
 if __name__ == "__main__":
-    # 自测：验证指标识别与知识块生成
     ik = IndicatorKnowledge()
 
     test_questions = [
-        "查询上个月的利润",
-        "按产品线统计毛利率",
-        "查询已完成订单的总数量",
+        "最近一个月停车收入是多少",
+        "哪个停车场利用率最低",
+        "平均停车时间是多少",
+        "收入下降原因",
     ]
 
     for q in test_questions:
