@@ -37,6 +37,7 @@ class PlanStep(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     metrics: list[str] = Field(default_factory=list)
     dimensions: list[str] = Field(default_factory=list)
+    tools: list[str] = Field(default_factory=list)
     expected_output: str
 
 
@@ -68,6 +69,7 @@ class StepExecutionResult(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list)
     formatted: str = ""
     error: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionSummary(BaseModel):
@@ -80,6 +82,58 @@ class ExecutionSummary(BaseModel):
     skipped_steps: int = 0
     key_findings: list[str] = Field(default_factory=list)
     summary_text: str
+
+
+class ToolTrace(BaseModel):
+    """Agent 单次工具调用轨迹。"""
+
+    tool_name: str
+    stage: str
+    status: Literal["completed", "empty", "failed"]
+    summary: str
+    error: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ParkingPlanningContext(BaseModel):
+    """Planner 执行前收集的指标和 Schema 上下文。"""
+
+    intent: str
+    metrics: list[str] = Field(default_factory=list)
+    metric_details: list[dict[str, Any]] = Field(default_factory=list)
+    tables: list[str] = Field(default_factory=list)
+    fields: list[str] = Field(default_factory=list)
+    anchor: str = ""
+    join_path: dict[str, Any] = Field(default_factory=dict)
+    tool_traces: list[ToolTrace] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class AgentState(BaseModel):
+    """单次智慧停车 Agent 请求的可观测状态快照。"""
+
+    user_query: str
+    intent: str = "query"
+    status: Literal[
+        "initializing",
+        "planning",
+        "executing",
+        "summarizing",
+        "reporting",
+        "completed",
+        "completed_with_errors",
+        "failed",
+    ] = "initializing"
+    metrics: list[str] = Field(default_factory=list)
+    tables: list[str] = Field(default_factory=list)
+    fields: list[str] = Field(default_factory=list)
+    decomposition: dict[str, Any] = Field(default_factory=dict)
+    plan: dict[str, Any] = Field(default_factory=dict)
+    step_results: list[dict[str, Any]] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    report: dict[str, Any] = Field(default_factory=dict)
+    tool_traces: list[ToolTrace] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class PlanGenerator:
@@ -109,6 +163,7 @@ class PlanGenerator:
                     depends_on=[task_to_step[dep] for dep in task.depends_on],
                     metrics=task.metrics,
                     dimensions=task.dimensions,
+                    tools=self._select_tools(task),
                     expected_output=self._build_expected_output(task),
                 )
             )
@@ -152,13 +207,150 @@ class PlanGenerator:
             focus_parts.append("可被后续步骤复用的结构化结果")
         return "；".join(focus_parts)
 
+    @staticmethod
+    def _select_tools(task: DecomposedTask) -> list[str]:
+        """当前所有数据证据任务复用同一条 ChatBI 工具链。"""
+        return [
+            "metric_retriever",
+            "schema_retriever",
+            "text2sql",
+            "sql_executor",
+        ]
+
 
 StepRunner = Callable[[str], dict[str, Any]]
+MetricRetriever = Callable[[str], dict[str, Any]]
+SchemaRetriever = Callable[[str], dict[str, Any]]
 
 def _print_progress(message: str) -> None:
     """直接打印主链路进度日志。"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+
+def _classify_parking_intent(question: str) -> str:
+    """用轻量规则给 Planner 和可观测状态提供稳定意图标签。"""
+    if any(keyword in question for keyword in ("原因", "为什么", "下降", "下滑")):
+        return "diagnosis"
+    if any(keyword in question for keyword in ("运营情况", "运营分析", "综合分析", "经营情况")):
+        return "overview"
+    if any(keyword in question for keyword in ("趋势", "变化", "同比", "环比")):
+        return "trend"
+    if any(keyword in question for keyword in ("哪个停车场", "最高", "最低", "排名")):
+        return "ranking"
+    return "query"
+
+
+class ParkingContextResolver:
+    """Agent 工具包装：规划前联合解析 Metric RAG 与 Schema Linking 上下文。"""
+
+    def __init__(
+        self,
+        metric_retriever: MetricRetriever | None = None,
+        schema_retriever: SchemaRetriever | None = None,
+    ):
+        self.metric_retriever = metric_retriever or self._retrieve_metrics
+        self.schema_retriever = schema_retriever or self._retrieve_schema
+
+    def resolve(self, question: str) -> ParkingPlanningContext:
+        context = ParkingPlanningContext(intent=_classify_parking_intent(question))
+
+        try:
+            metric_context = self.metric_retriever(question)
+            retrieved = metric_context.get("retrieved_indicators", [])
+            context.metrics = list(dict.fromkeys(
+                [item.get("name", "") for item in retrieved if item.get("name")]
+                or metric_context.get("detected_indicators", [])
+            ))
+            context.metric_details = [
+                {
+                    "name": item.get("name"),
+                    "formula": item.get("formula"),
+                    "tables": item.get("tables", []),
+                    "fields": item.get("fields", []),
+                    "dimensions": item.get("dimensions", []),
+                    "is_dependency": item.get("is_dependency", False),
+                    "is_related": item.get("is_related", False),
+                }
+                for item in retrieved
+            ]
+            metric_status = "completed" if context.metrics else "empty"
+            context.tool_traces.append(ToolTrace(
+                tool_name="metric_retriever",
+                stage="planning_context",
+                status=metric_status,
+                summary=(
+                    f"召回指标：{'、'.join(context.metrics)}"
+                    if context.metrics
+                    else "未召回明确指标，后续使用关键词/Prompt兜底"
+                ),
+                metadata={"metric_count": len(context.metrics)},
+            ))
+        except Exception as exc:
+            message = f"指标检索失败：{exc}"
+            context.errors.append(message)
+            context.tool_traces.append(ToolTrace(
+                tool_name="metric_retriever",
+                stage="planning_context",
+                status="failed",
+                summary="指标检索失败，执行链继续使用下游 fallback",
+                error=str(exc),
+            ))
+
+        try:
+            schema_context = self.schema_retriever(question)
+            context.tables = [
+                table.get("table_name", "")
+                for table in schema_context.get("tables", [])
+                if table.get("table_name")
+            ]
+            context.fields = [
+                field.get("field_key", "")
+                for field in schema_context.get("fields", [])
+                if field.get("field_key")
+            ]
+            context.anchor = schema_context.get("anchor", "")
+            context.join_path = schema_context.get("join_path", {})
+            schema_status = "completed" if context.tables else "empty"
+            context.tool_traces.append(ToolTrace(
+                tool_name="schema_retriever",
+                stage="planning_context",
+                status=schema_status,
+                summary=(
+                    f"召回表：{'、'.join(context.tables)}"
+                    if context.tables
+                    else "未召回候选表，Text2SQL 将使用静态 Schema 兜底"
+                ),
+                metadata={
+                    "table_count": len(context.tables),
+                    "field_count": len(context.fields),
+                    "anchor": context.anchor,
+                },
+            ))
+        except Exception as exc:
+            message = f"Schema Linking失败：{exc}"
+            context.errors.append(message)
+            context.tool_traces.append(ToolTrace(
+                tool_name="schema_retriever",
+                stage="planning_context",
+                status="failed",
+                summary="Schema Linking失败，Text2SQL 将使用静态 Schema 兜底",
+                error=str(exc),
+            ))
+
+        return context
+
+    @staticmethod
+    def _retrieve_metrics(question: str) -> dict[str, Any]:
+        from rag.indicator_retriever import retrieve_indicator_context
+
+        return retrieve_indicator_context(question)
+
+    @staticmethod
+    def _retrieve_schema(question: str) -> dict[str, Any]:
+        from schema.schema_linker import schema_link
+
+        return schema_link(question)
 
 
 class IntermediateResultStore:
@@ -593,6 +785,7 @@ class StepExecutor:
             rows=normalized_rows,
             formatted=raw_result.get("formatted", ""),
             error=raw_result.get("error"),
+            metadata=raw_result.get("metadata", {}),
         )
 
     def _store_intermediate_result(
@@ -730,42 +923,116 @@ class PlanAndExecuteAgent:
         executor: StepExecutor | None = None,
         summarizer: ResultSummarizer | None = None,
         report_generator: ReportGenerator | None = None,
+        context_resolver: ParkingContextResolver | None = None,
     ):
         self.decomposer = decomposer or QueryDecomposer()
         self.planner = planner or PlanGenerator()
         self.executor = executor or StepExecutor()
         self.summarizer = summarizer or ResultSummarizer()
         self.report_generator = report_generator or ReportGenerator()
+        self.context_resolver = context_resolver or ParkingContextResolver()
 
     def run(
         self,
         user_question: str,
         decomposition_override: dict[str, Any] | None = None,
         max_steps: int | None = None,
+        resolve_context: bool | None = None,
     ) -> dict[str, Any]:
+        state = AgentState(
+            user_query=user_question,
+            intent=_classify_parking_intent(user_question),
+        )
+
+        # 测试或人工传入分解结果时默认跳过外部检索；真实 Agent 请求默认执行
+        # 一次规划前 Metric RAG + Schema Linking，让 Planner 看见业务上下文。
+        should_resolve_context = (
+            decomposition_override is None
+            if resolve_context is None
+            else resolve_context
+        )
+        planning_context = ParkingPlanningContext(intent=state.intent)
+        if should_resolve_context:
+            _print_progress("开始解析智慧停车指标与 Schema 上下文。")
+            planning_context = self.context_resolver.resolve(user_question)
+            state.intent = planning_context.intent
+            state.metrics = planning_context.metrics
+            state.tables = planning_context.tables
+            state.fields = planning_context.fields
+            state.tool_traces.extend(planning_context.tool_traces)
+            state.errors.extend(planning_context.errors)
+            _print_progress(
+                f"规划上下文完成：metrics={len(state.metrics)}, "
+                f"tables={len(state.tables)}, fields={len(state.fields)}"
+            )
+
+        state.status = "planning"
         if decomposition_override is not None:
             _print_progress("使用传入的拆解结果，跳过任务拆解。")
             decomposition = decomposition_override
         else:
             _print_progress("开始任务拆解。")
-            decomposition = self.decomposer.decompose(user_question)
+            decomposition = self.decomposer.decompose(
+                user_question,
+                planning_context=planning_context.model_dump(),
+            )
             _print_progress(
                 f"任务拆解完成，共 {len(decomposition.get('subtasks', []))} 个子任务。"
             )
+        state.decomposition = decomposition
+        state.tool_traces.append(ToolTrace(
+            tool_name="planner",
+            stage="planning",
+            status="completed",
+            summary=f"生成 {len(decomposition.get('subtasks', []))} 个停车分析子任务",
+        ))
 
         _print_progress("开始生成执行计划。")
         plan = self.planner.build_plan(user_question, decomposition)
+        state.plan = plan.model_dump()
         _print_progress(f"执行计划生成完成，共 {len(plan.steps)} 个步骤。")
+        state.status = "executing"
         step_results = self.executor.execute_plan(plan, max_steps=max_steps)
+        state.step_results = [result.model_dump() for result in step_results]
+        for result in step_results:
+            state.tool_traces.append(ToolTrace(
+                tool_name="text2sql_sql_executor",
+                stage=result.step_id,
+                status="completed" if result.success else "failed",
+                summary=(
+                    f"{result.step_name}执行成功"
+                    if result.success
+                    else f"{result.step_name}执行失败"
+                ),
+                error=result.error,
+                metadata={
+                    "attempts": result.attempts,
+                    "sql": result.sql,
+                    "result_reference": result.result_reference,
+                    "chatbi_metadata": result.metadata,
+                },
+            ))
+            if result.error:
+                state.errors.append(f"{result.step_id}: {result.error}")
+
+        state.status = "summarizing"
         _print_progress("开始生成执行摘要。")
         summary = self.summarizer.summarize(user_question, plan, step_results)
+        state.summary = summary.model_dump()
         _print_progress("执行摘要生成完成。")
+        state.status = "reporting"
         _print_progress("开始生成分析报告。")
         report = self.report_generator.generate(
             original_question=user_question,
             analysis_goal=plan.analysis_goal,
             step_results=[result.model_dump() for result in step_results],
             summary=summary.model_dump(),
+        )
+        state.report = report.model_dump()
+        state.status = (
+            "completed_with_errors"
+            if summary.failed_steps or summary.skipped_steps
+            else "completed"
         )
         _print_progress("分析报告生成完成。")
 
@@ -776,6 +1043,7 @@ class PlanAndExecuteAgent:
             "step_results": [result.model_dump() for result in step_results],
             "summary": summary.model_dump(),
             "report": report.model_dump(),
+            "agent_state": state.model_dump(),
         }
 
 
@@ -787,8 +1055,8 @@ def _json_default(value: Any) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plan-and-Execute Agent 骨架")
-    parser.add_argument("question", nargs="?", default="最近三个月利润为什么下降？")
+    parser = argparse.ArgumentParser(description="智慧停车 Plan-and-Execute Agent")
+    parser.add_argument("question", nargs="?", default="最近三个月停车收入为什么下降？")
     parser.add_argument(
         "--plan-only",
         action="store_true",
