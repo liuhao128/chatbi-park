@@ -1,126 +1,172 @@
 """
-Prompt 构造模块
+智慧停车 ChatBI Prompt 构造模块。
 
-负责将 Schema 信息、Few-shot 示例和用户问题组装为完整 Prompt。
-Schema 和示例在此集中维护，便于后续课程中动态扩展。
+负责将动态/静态 Schema、停车业务规则、Few-shot 示例、错误防护、
+指标知识和用户问题组装为 Text2SQL Prompt。
 
-第7课增强：新增 RULES（业务规则注入层）与 ERROR_GUARDS（错误防护层），
-通过 build_prompt 的可选参数控制是否注入，实现 Prompt 策略的灵活切换。
+设计原则：
+1. 动态 Schema Linking 结果优先，静态六表 Schema 只作为兜底；
+2. Prompt 中的表名、字段名和业务口径必须与 Day8 Schema 一致；
+3. 业务规则负责约束语义，SQL 生成与执行逻辑仍由原有模块负责。
 """
 
 
-# ==================== Schema 定义 ====================
+# ==================== System Prompt ====================
+SYSTEM_MESSAGE = (
+    "你是一名智慧停车运营分析与 Text2SQL 专家。"
+    "你能够理解停车收入、停车订单、停车场经营、车位利用率、停车时长、"
+    "车流高峰和运营异常等问题，并依据提供的数据库 Schema 生成标准 MySQL 查询。"
+    "只使用上下文明确提供的表、字段、关联关系和业务口径，不得编造数据库对象。"
+)
+
+STRICT_SYSTEM_MESSAGE = (
+    f"{SYSTEM_MESSAGE}"
+    "请严格遵守关键业务规则和错误防护；当指标知识与当前 Schema 冲突时，"
+    "以当前 Schema 和关键业务规则为准。"
+)
+
+
+# ==================== 静态兜底 Schema ====================
+# 动态 Schema Linking 开启且召回成功时会替换该文本；这里必须与
+# database/01_schema.sql 的六张停车 MVP 表保持一致。
 SCHEMA = """
-表：dim_customers（客户维度表）
-- customer_id INT 主键
-- customer_name VARCHAR(100) 客户名称
-- customer_type VARCHAR(50) 客户类型：OEM整车厂 / 储能集成商 / 电网集团 / 工商业用户 / 换电运营商 / 经销商
-- industry VARCHAR(50) 客户行业：交通 / 能源 / 工业 / 特种交通
-- country VARCHAR(50) 具体国家，如 Germany
-- region VARCHAR(50) 大区，如 欧洲、北美
+表：dim_parking_lot（停车场维度表）
+- parking_lot_id BIGINT 主键，停车场ID
+- parking_lot_name VARCHAR(100)，停车场名称
+- operator_id BIGINT，运营商ID
+- city_name VARCHAR(50)，所属城市
+- parking_lot_type VARCHAR(30)，停车场类型，如商业、园区、医院
+- total_spaces INT，停车场基础总车位数
+- operation_status VARCHAR(20)，运营状态：operating / closed / maintenance
+- updated_at DATETIME，数据更新时间，不是经营统计时间
 
-表：dim_products（产品维度表）
-- product_id INT 主键
-- product_name VARCHAR(100) 产品名称
-- product_line VARCHAR(50) 产品线：动力电池-乘用车 / 动力电池-商用车 / 储能系统-电网级 / 储能系统-工商业 / 电池材料与回收
-- category VARCHAR(50) 产品分类：高能量密度型 / 超快充型 / 混动专用型 / 低温适配型 / 商用车标准型 / 电网级储能型 / 工商业储能型
-- tech_route VARCHAR(50) 技术路线：三元锂 / 磷酸铁锂 / 钠离子 / 固态电池
-- standard_cost DECIMAL(10,2) 标准成本
-- material_cost DECIMAL(10,2) 材料成本
-- labor_cost DECIMAL(10,2) 人工成本
+表：fact_parking_order（停车订单事实表）
+- order_id BIGINT 主键，停车订单ID
+- parking_lot_id BIGINT，关联 dim_parking_lot.parking_lot_id
+- order_type VARCHAR(20)，订单类型：temporary / monthly / visitor
+- entry_time DATETIME，车辆入场时间
+- exit_time DATETIME，车辆出场时间，未出场时为空
+- parking_minutes INT，停车时长，单位分钟
+- order_status VARCHAR(20)，订单状态：active / completed / cancelled / exception
+- receivable_amount DECIMAL(12,2)，应收金额
+- discount_amount DECIMAL(12,2)，优惠减免金额
+- paid_amount DECIMAL(12,2)，实收金额
+- refund_amount DECIMAL(12,2)，退款金额
+- payment_status VARCHAR(20)，支付状态：unpaid / paid / refunded
+- payment_method VARCHAR(20)，支付方式：wechat / alipay / cash
+- manual_open_flag TINYINT，是否人工抬杆，0否1是
+- free_release_flag TINYINT，是否免费放行，0否1是
+- updated_at DATETIME，数据更新时间，不是默认收入统计时间
 
-表：sales_orders（销售订单表）
-- order_id BIGINT 主键
-- order_no VARCHAR(50) 订单编号
-- customer_id INT 外键 → dim_customers.customer_id
-- product_id INT 外键 → dim_products.product_id
-- region VARCHAR(50) 销售区域
-- order_date DATE 订单日期
-- order_status VARCHAR(20) 订单状态：completed / cancelled / pending
-- quantity DECIMAL(10,2) 数量（MWh 或套数）
-- unit_price DECIMAL(10,2) 单价（每 MWh 或每套价格，不含税）
-- discount_amount DECIMAL(10,2) 折扣金额
-- gross_amount DECIMAL(12,2) 含税总额
-- net_amount DECIMAL(12,2) 不含税收入（财务口径的销售额）
-- currency VARCHAR(10) 币种
+表：fact_space_snapshot（车位状态快照事实表）
+- snapshot_id BIGINT 主键，快照ID
+- parking_lot_id BIGINT，关联 dim_parking_lot.parking_lot_id
+- snapshot_time DATETIME，快照时间
+- total_spaces INT，快照时点可运营车位数
+- occupied_spaces INT，快照时点已占用车位数
+- free_spaces INT，快照时点空闲车位数
 
-表：exchange_rates（汇率表）
-- rate_date DATE 日期
-- currency VARCHAR(10) 币种
-- rate_to_cny DECIMAL(10,4) 兑人民币汇率
+表：fact_operation_event（运营异常事件事实表）
+- event_id BIGINT 主键，事件ID
+- parking_lot_id BIGINT，关联 dim_parking_lot.parking_lot_id
+- order_id BIGINT，可选关联 fact_parking_order.order_id
+- event_time DATETIME，事件发生时间
+- event_type VARCHAR(50)，事件类型，如支付失败、设备离线、人工抬杆
+- severity VARCHAR(20)，严重程度：low / medium / high
+- event_status VARCHAR(20)，处理状态：pending / processing / resolved
+- estimated_loss DECIMAL(12,2)，预估收入损失，不等于实际停车收入
+- description VARCHAR(500)，事件说明
 
-表：finance_expenses（费用表）
-- expense_id BIGINT 主键
-- expense_date DATE 费用日期
-- department VARCHAR(50) 部门
-- rd_expense DECIMAL(12,2) 研发费用（新能源企业研发投入大）
-- selling_expense DECIMAL(12,2) 销售费用
-- admin_expense DECIMAL(12,2) 管理费用
-- finance_expense DECIMAL(12,2) 财务费用
-- marketing_expense DECIMAL(12,2) 市场费用（属于销售费用子项）
-- logistics_expense DECIMAL(12,2) 物流费用
-- warranty_expense DECIMAL(12,2) 质保费用
+表：agg_parking_daily（停车场日经营汇总表）
+- stat_date DATE，统计日期，与 parking_lot_id 组成主键
+- parking_lot_id BIGINT，关联 dim_parking_lot.parking_lot_id
+- order_count INT，当日已完成订单量
+- net_revenue DECIMAL(14,2)，当日停车净收入，等于实收减退款
+- average_parking_minutes DECIMAL(10,2)，当日平均停车时长，单位分钟
+- average_occupied_spaces DECIMAL(10,2)，当日平均占用车位数
+- utilization_rate DECIMAL(8,4)，当日车位利用率，取值0至1
+- manual_open_count INT，人工抬杆次数
+- free_release_count INT，免费放行次数
+- exception_count INT，异常事件数量
+- updated_at DATETIME，数据更新时间，不是业务统计日期
+
+表：agg_parking_hourly（停车场小时经营汇总表）
+- stat_date DATE，统计日期
+- stat_hour TINYINT，统计小时，取值0至23
+- parking_lot_id BIGINT，关联 dim_parking_lot.parking_lot_id
+- order_count INT，该小时已完成订单量
+- net_revenue DECIMAL(14,2)，该小时停车净收入
+- occupied_spaces DECIMAL(10,2)，该小时平均占用车位数
+- utilization_rate DECIMAL(8,4)，该小时车位利用率，取值0至1
+- exception_count INT，该小时异常事件数量
+- updated_at DATETIME，数据更新时间，不是业务统计时间
+
+表间关系：
+- fact_parking_order.parking_lot_id = dim_parking_lot.parking_lot_id
+- fact_space_snapshot.parking_lot_id = dim_parking_lot.parking_lot_id
+- fact_operation_event.parking_lot_id = dim_parking_lot.parking_lot_id
+- fact_operation_event.order_id = fact_parking_order.order_id
+- agg_parking_daily.parking_lot_id = dim_parking_lot.parking_lot_id
+- agg_parking_hourly.parking_lot_id = dim_parking_lot.parking_lot_id
 """
 
 
 # ==================== Few-shot 示例 ====================
 FEW_SHOT_EXAMPLES = """
 示例1：
-问题：查询已完成订单的总数量
-SQL：SELECT COUNT(*) FROM sales_orders WHERE order_status = 'completed';
+问题：今天停车收入是多少？
+SQL：SELECT COALESCE(SUM(net_revenue), 0) AS parking_revenue FROM agg_parking_daily WHERE stat_date = CURDATE();
 
 示例2：
-问题：按客户类型统计订单数量
-SQL：SELECT c.customer_type, COUNT(*) AS order_count FROM sales_orders o JOIN dim_customers c ON o.customer_id = c.customer_id WHERE o.order_status = 'completed' GROUP BY c.customer_type;
+问题：最近三个月收入趋势？
+SQL：SELECT DATE_FORMAT(stat_date, '%Y-%m-01') AS revenue_month, SUM(net_revenue) AS parking_revenue FROM agg_parking_daily WHERE stat_date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH) AND stat_date < CURDATE() + INTERVAL 1 DAY GROUP BY DATE_FORMAT(stat_date, '%Y-%m-01') ORDER BY revenue_month;
 
 示例3：
-问题：查询2026年第一季度的总费用
-SQL：SELECT SUM(rd_expense + selling_expense + admin_expense + finance_expense) AS total_expense FROM finance_expenses WHERE expense_date >= '2026-01-01' AND expense_date < '2026-04-01';
+问题：最近三个月哪个停车场收入最高？
+SQL：SELECT p.parking_lot_name, SUM(d.net_revenue) AS parking_revenue FROM agg_parking_daily d JOIN dim_parking_lot p ON d.parking_lot_id = p.parking_lot_id WHERE d.stat_date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH) AND d.stat_date < CURDATE() + INTERVAL 1 DAY GROUP BY p.parking_lot_id, p.parking_lot_name ORDER BY parking_revenue DESC LIMIT 1;
 
 示例4：
-问题：查看最近三个月各月销售收入
-SQL：SELECT
-    DATE_FORMAT(o.order_date, '%Y-%m-01') AS month,
-    SUM(o.net_amount * r.rate_to_cny) AS revenue_cny
-FROM sales_orders o
-JOIN exchange_rates r
-  ON o.order_date = r.rate_date
- AND o.currency = r.currency
-WHERE o.order_status = 'completed'
-  AND o.order_date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH)
-  AND o.order_date < CURDATE() + INTERVAL 1 DAY
-GROUP BY DATE_FORMAT(o.order_date, '%Y-%m-01')
-ORDER BY month;
+问题：哪个停车场利用率最低？
+SQL：SELECT p.parking_lot_name, AVG(d.utilization_rate) AS average_utilization_rate FROM agg_parking_daily d JOIN dim_parking_lot p ON d.parking_lot_id = p.parking_lot_id WHERE p.operation_status = 'operating' GROUP BY p.parking_lot_id, p.parking_lot_name ORDER BY average_utilization_rate ASC LIMIT 1;
+
+示例5：
+问题：平均停车时长是多少？
+SQL：SELECT AVG(parking_minutes) AS average_parking_minutes FROM fact_parking_order WHERE order_status = 'completed' AND parking_minutes IS NOT NULL;
 """
 
 
-# ==================== 规则注入层（第7课新增）====================
+# ==================== 停车业务规则 ====================
 RULES = """
 【关键业务规则】
-1. 收入口径："销售额""收入"均指不含税收入，统一使用 sales_orders.net_amount，禁止使用 gross_amount
-2. 成本口径："成本"指实际销售成本，计算公式为 dim_products.material_cost + dim_products.labor_cost
-3. 订单统计范围：统计收入、订单量、客单价等指标时，必须过滤 order_status = 'completed'，排除 cancelled 和 pending
-4. 汇率转换：涉及多币种收入汇总时，必须通过 order_date 和 currency 关联 exchange_rates 表，使用 rate_to_cny 折算为人民币
-5. 时间范围："最近N个月"使用 DATE_SUB(CURDATE(), INTERVAL N MONTH) 作为起始边界；"本月"指当月1日至当前日期
-6. 费用层级：selling_expense 是销售费用总项，包含 marketing_expense、logistics_expense、warranty_expense，汇总时不得重复计算
-7. 毛利计算：毛利 = net_amount - (material_cost + labor_cost) * quantity
-8. 不要引用 Schema 中不存在的字段，例如 channel
+1. 停车收入：默认指净收入。日/小时趋势和停车场排名优先使用 agg_parking_daily.net_revenue 或 agg_parking_hourly.net_revenue；明细查询使用 SUM(fact_parking_order.paid_amount - fact_parking_order.refund_amount)。不要把 receivable_amount、discount_amount 或 estimated_loss 当作实际收入。
+2. 收入时间：聚合表按 stat_date 统计；订单明细收入按 exit_time 归属，并过滤 order_status = 'completed'。updated_at 只表示数据更新时间，不能作为收入、订单、利用率或异常的业务时间。
+3. 停车订单量：聚合查询优先使用 agg_parking_daily.order_count 或 agg_parking_hourly.order_count；明细查询使用 COUNT(fact_parking_order.order_id)，统计完成订单时过滤 order_status = 'completed'。
+4. 平均停车时长：明细使用 AVG(fact_parking_order.parking_minutes)，过滤 completed 且 parking_minutes IS NOT NULL；跨日汇总不能直接对 average_parking_minutes 再做简单平均，应按 order_count 加权，或回到订单明细重算。
+5. 车位利用率：历史日/小时分析使用聚合表 utilization_rate；快照明细使用 occupied_spaces / NULLIF(total_spaces, 0)。利用率字段取值0至1，不得 SUM；需要百分比展示时再乘100。历史利用率分母不得使用 dim_parking_lot.total_spaces。
+6. 当前车位：查询当前空闲/占用车位时使用 fact_space_snapshot，并为每个停车场选择 snapshot_time 最新的一条快照。
+7. 停车场维度：输出停车场名称、城市或类型时，通过 parking_lot_id 关联 dim_parking_lot。比较经营表现时，除非用户另有要求，排除 operation_status 非 operating 的停车场。
+8. 高峰时段：按小时分析使用 agg_parking_hourly.stat_date 和 stat_hour；“最忙”默认按 order_count 或 utilization_rate 判断，只有用户明确问收入高峰时才使用 net_revenue。
+9. 异常诊断：收入下降原因只能根据订单量、退款、免费放行、人工抬杆、利用率、异常数量和 fact_operation_event 等证据分析。estimated_loss 是预估损失，不能当作已确认收入损失；数据不足时不得虚构因果。
+10. 时间范围：“最近N个月”使用 DATE_SUB(CURDATE(), INTERVAL N MONTH) 作为起始边界；“今天”使用 CURDATE()；范围查询优先使用 >= 起点且 < 终点的闭开区间。
 """
 
 
-# ==================== 错误防护层（第7课新增）====================
+# ==================== Text2SQL 错误防护 ====================
 ERROR_GUARDS = """
 【常见错误防护】
-- 字段选择：确认金额字段是 net_amount（不含税）还是 gross_amount（含税），除非明确要求"含税"，否则一律用 net_amount
-- Join 遗漏：只要查询涉及"收入"且存在 currency 字段，必须关联 exchange_rates 表做汇率转换
-- 过滤遗漏：所有收入类统计必须包含 WHERE order_status = 'completed'
-- 时间边界：使用 >= 和 < 组合表示闭开区间；“最近N个月”按 DATE_SUB(CURDATE(), INTERVAL N MONTH) 处理
-- 聚合维度：GROUP BY 字段必须与 SELECT 中的非聚合字段完全一致
-- 字段合法性：不要输出 Schema 中不存在的字段；如果问题里出现未建模维度，优先回退到产品线、区域、客户、月份等已有维度
+- Schema 优先级：只使用【数据库Schema】实际出现的表和字段。不要生成 parking_fee、pay_time、occupied_space、parking_space 等当前 Schema 不存在的字段。
+- 知识冲突：如果注入的指标知识仍引用销售、客户、产品、汇率或费用等旧业务对象，视为与当前停车 Schema 冲突并忽略。
+- 收入口径：默认净收入不是应收金额，也不是预估损失；订单明细必须使用 paid_amount - refund_amount。
+- 时间字段：入场车流使用 entry_time，完成订单和明细收入使用 exit_time，车位状态使用 snapshot_time，异常使用 event_time，聚合趋势使用 stat_date；禁止使用 updated_at 代替业务时间。
+- 聚合粒度：不要在同一指标中直接混合订单明细、车位快照、日聚合和小时聚合，避免重复统计；能由一张聚合表回答的问题不要无必要回到明细表。
+- Join 防重复：事实表之间不要仅凭 parking_lot_id 直接 Join，否则可能产生多对多行膨胀；需要多个事实口径时应先分别聚合到相同粒度，再进行关联。
+- 比率与平均值：utilization_rate 不得 SUM；跨日平均停车时长应按 order_count 加权或使用订单明细 AVG，不能直接平均各日平均值。
+- 分组规则：SELECT 中的非聚合字段必须出现在 GROUP BY 中；停车场排名建议同时按 parking_lot_id 和 parking_lot_name 分组。
+- 空值与除零：exit_time、parking_minutes 可能为空；除法使用 NULLIF(分母, 0)，金额汇总可使用 COALESCE。
+- 只读约束：只生成一条 SELECT 或 WITH ... SELECT 查询，禁止 INSERT、UPDATE、DELETE、DROP、ALTER、TRUNCATE、CREATE。
 """
 
 
-# ==================== Prompt 构造函数 ====================
 def build_prompt(
     user_question: str,
     use_few_shot: bool = True,
@@ -129,79 +175,75 @@ def build_prompt(
     indicator_knowledge: str = "",
     use_schema_linking: bool = False,
 ) -> tuple[str, str]:
-    """
-    构造发送给 LLM 的 Prompt
+    """构造发送给 LLM 的智慧停车 Text2SQL Prompt。
 
     Args:
-        user_question: 用户的自然语言问题
-        use_few_shot: 是否使用 Few-shot 示例
-        use_rules: 是否注入业务规则层（第7课新增）
-        use_guards: 是否注入错误防护层（第7课新增）
-        indicator_knowledge: 指标知识文本块（第9课新增）
-        use_schema_linking: 是否使用动态 Schema Linking（第18课新增）
-                           为 True 时调用 schema_linker 动态生成精简 Schema，
-                           失败时自动回退到全量 Schema。
+        user_question: 用户自然语言问题。
+        use_few_shot: 是否注入智慧停车 Few-shot 示例。
+        use_rules: 是否注入停车业务规则。
+        use_guards: 是否注入 Text2SQL 错误防护。
+        indicator_knowledge: 可选的指标知识文本块。
+        use_schema_linking: 是否使用动态 Schema Linking；失败时回退到静态六表 Schema。
 
     Returns:
         (system_message, user_message)
     """
-    system_msg = "你是一个专业的 SQL 生成助手，擅长根据业务问题生成标准 MySQL 查询语句。"
-    if use_rules or use_guards:
-        system_msg = "你是一个专业的 SQL 生成助手，擅长根据业务问题生成标准 MySQL 查询语句。请严格遵守给定的业务规则，避免常见错误。"
+    system_msg = (
+        STRICT_SYSTEM_MESSAGE
+        if use_rules or use_guards
+        else SYSTEM_MESSAGE
+    )
 
-    # 第18课新增：动态 Schema Linking（失败时自动回退全量 Schema）
+    # 动态 Schema 只注入与问题相关的表、字段和 Join，降低 Token 消耗；
+    # 召回失败或功能未开启时，回退到与 Day8 DDL 对齐的静态六表 Schema。
     schema_text = SCHEMA
     if use_schema_linking:
         try:
             from schema.schema_linker import build_dynamic_prompt_schema
+
             dynamic_schema = build_dynamic_prompt_schema(user_question)
             if dynamic_schema:
                 schema_text = dynamic_schema
         except Exception:
-            pass  # 回退到全量 SCHEMA
+            pass
 
-    prompt = f"""【数据库Schema】
-{schema_text}
-"""
+    prompt_parts = [f"【数据库Schema】\n{schema_text}"]
+
     if use_rules:
-        prompt += f"""
-{RULES}
-"""
+        prompt_parts.append(RULES)
 
     if use_few_shot:
-        prompt += f"""
-【示例】
-{FEW_SHOT_EXAMPLES}
-"""
+        prompt_parts.append(f"【智慧停车示例】\n{FEW_SHOT_EXAMPLES}")
 
     if use_guards:
-        prompt += f"""
-{ERROR_GUARDS}
-"""
+        prompt_parts.append(ERROR_GUARDS)
 
     if indicator_knowledge:
-        prompt += f"""
-{indicator_knowledge}
-"""
+        prompt_parts.append(
+            "【检索到的指标知识】\n"
+            "以下知识只作补充；如果与当前数据库Schema或关键业务规则冲突，必须忽略冲突内容。\n"
+            f"{indicator_knowledge}"
+        )
 
-    prompt += f"""
-【用户问题】
-{user_question}
-
-【要求】
-1. 只输出 SQL 语句，不需要解释
-2. 使用标准 MySQL 语法
-3. 确保字段名和表名与 Schema 一致
-4. 如果涉及多表查询，使用 JOIN 连接
-5. 收入口径统一使用 net_amount，成本口径使用 material_cost + labor_cost
-6. 统计销售额时，需要按订单日期的汇率转换为人民币
-7. SQL 必须完整闭合，CTE、SELECT、GROUP BY、ORDER BY 不得省略，不要输出截断的半句 SQL
-"""
+    requirements = [
+        "只输出一条完整 SQL，不要解释，不要使用 Markdown 代码块",
+        "使用标准 MySQL 8.0 语法，只生成 SELECT 或 WITH ... SELECT 只读查询",
+        "只能使用【数据库Schema】中出现的表名、字段名和表间关联",
+        "先识别指标、维度、时间范围和业务粒度，再选择最匹配的事实表",
+        "涉及多表时使用 Schema 给出的 Join 条件，避免事实表直接 Join 导致重复统计",
+        "SQL 必须完整闭合，SELECT、CTE、JOIN、WHERE、GROUP BY、ORDER BY、LIMIT 不得输出半句",
+    ]
     if use_rules or use_guards:
-        prompt += """8. 优先遵循【关键业务规则】和【常见错误防护】中的约束
-"""
+        requirements.append("优先遵循【关键业务规则】和【常见错误防护】")
 
-    prompt += """
-请直接输出 SQL：
-"""
-    return system_msg, prompt
+    numbered_requirements = "\n".join(
+        f"{index}. {requirement}"
+        for index, requirement in enumerate(requirements, start=1)
+    )
+    prompt_parts.append(
+        f"【用户问题】\n{user_question}\n\n"
+        f"【输出要求】\n{numbered_requirements}\n\n"
+        "请直接输出 SQL："
+    )
+
+    return system_msg, "\n\n".join(prompt_parts)
