@@ -54,6 +54,23 @@ class SyntaxErrorCursor:
         return []
 
 
+class UnknownColumnCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql: str):
+        raise pymysql.err.OperationalError(
+            1054,
+            "Unknown column 'missing_metric' in 'field list'",
+        )
+
+    def fetchall(self):
+        return []
+
+
 class TimedOutCursor:
     def __enter__(self):
         return self
@@ -94,6 +111,18 @@ def test_database_client_classifies_sql_syntax_errors():
 
     assert exc_info.value.error_type == "sql_syntax"
     assert exc_info.value.metadata["error_code"] == 1064
+
+
+def test_database_client_classifies_unknown_column_as_sql_structure_error():
+    client = DatabaseClient(
+        connection_factory=lambda: FakeConnection(UnknownColumnCursor())
+    )
+
+    with pytest.raises(QueryExecutionError) as exc_info:
+        client.execute("SELECT missing_metric FROM agg_parking_daily")
+
+    assert exc_info.value.error_type == "sql_syntax"
+    assert exc_info.value.metadata["error_code"] == 1054
 
 
 def test_database_client_classifies_connection_factory_errors():

@@ -59,7 +59,7 @@ APP_CONFIG = {
             "text-embedding-v3",
         ),
         "temperature": 0.1,
-        "max_tokens": int(os.getenv("LLM_MAX_TOKENS", 1000)),
+        "max_tokens": int(os.getenv("LLM_MAX_TOKENS", 4000)),
     },
     "features": {
         "few_shot": os.getenv("FEATURE_FEW_SHOT", "true").lower() == "true",

@@ -239,10 +239,16 @@ class DatabaseClient:
             "raw_error": error_text,
         }
 
-        if isinstance(exc, pymysql.err.ProgrammingError) or error_code == 1064:
+        # 模型生成的 SQL 除纯语法错误外，也常出现未知字段、字段歧义、
+        # ONLY_FULL_GROUP_BY 不满足或表不存在。这些都属于可由 Text2SQL
+        # 修正的 SQL 结构错误，不应作为未知数据库故障返回 500。
+        if (
+            isinstance(exc, pymysql.err.ProgrammingError)
+            or error_code in {1052, 1054, 1055, 1064, 1146}
+        ):
             return QueryExecutionError(
                 "sql_syntax",
-                "SQL 语法错误，请检查字段、聚合和别名是否正确",
+                "SQL 结构错误，请检查表、字段、聚合、分组和别名是否正确",
                 metadata,
             )
         if error_code in {1044, 1045, 1142, 1143, 1227}:
